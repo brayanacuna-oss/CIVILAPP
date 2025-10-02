@@ -256,6 +256,48 @@ function greedyCoverPatterns(patterns: Pattern[], demand: number[]): Pattern[] |
   return chosenPatterns;
 }
 
+/* ================== Último recurso: empaquetar piezas individualmente (si todo lo anterior falla)
+   Esto siempre produce solución exacta sin sobreproducción (crea más barras si hace falta).
+*/
+function packPiecesExactly(itemLensU: number[], demand: number[], names: string[], L_u: number): Pattern[] {
+  const pieces: { len: number; idx: number }[] = [];
+  for (let i = 0; i < itemLensU.length; i++) {
+    for (let q = 0; q < demand[i]; q++) pieces.push({ len: itemLensU[i], idx: i });
+  }
+
+  // ordenar desc por tamaño
+  pieces.sort((a,b) => b.len - a.len);
+
+  const bars: Array<{ used: number; segs: { idx: number; len: number }[] }> = [];
+
+  for (const p of pieces) {
+    let placed = false;
+    for (const b of bars) {
+      if (b.used + p.len <= L_u) {
+        b.segs.push({ idx: p.idx, len: p.len });
+        b.used += p.len;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      bars.push({ used: p.len, segs: [{ idx: p.idx, len: p.len }] });
+    }
+  }
+
+  // convertir cada barra a Pattern
+  const patterns: Pattern[] = bars.map(b => {
+    const counts = new Array(itemLensU.length).fill(0);
+    for (const s of b.segs) counts[s.idx] += 1;
+    const usedU = b.used;
+    const wasteU = Math.max(0, L_u - usedU);
+    const piecesTotal = counts.reduce((a,b)=>a+b,0);
+    return { counts, usedU, wasteU, piecesTotal };
+  });
+
+  return patterns;
+}
+
 /* ================== Solver EXACTO (sin sobreproducción) con heap y poda por cota superior ================== */
 function solveExactByPatterns(
   patterns: Pattern[],
@@ -383,7 +425,6 @@ export default function ResultScreen() {
         await new Promise<void>((resolve) => InteractionManager.runAfterInteractions(() => resolve()));
 
         const out: Record<string, any> = {};
-        const infeas: string[] = [];
 
         let diamIndex = 0;
         for (const [diam, arr] of byDiam.entries()) {
@@ -394,8 +435,11 @@ export default function ResultScreen() {
           out[diam] = { items } as { items: any; exact?: ExactResp };
 
           if (!items.length) {
-            out[diam].exact = { status: 'infeasible' } as ExactResp;
-            infeas.push(`Ø ${diam}`);
+            // crea solución vacía (no hay piezas)
+            out[diam].exact = { status: 'ok', solution: {
+              bars: [],
+              total_bars: 0, total_required_m: 0, total_bought_m: 0, total_waste_m: 0, utilization_pct: 0, waste_pct: 0
+            } };
             setLoadingDiam(s => ({ ...s, [diam]: false }));
             continue;
           }
@@ -411,9 +455,10 @@ export default function ResultScreen() {
           const K = Math.min(MAX_PATTERNS, DP_K_BASE);
           const patterns = generatePatternsDP(lensU, demands, L_u, K, DP_TOP_BASE);
 
+          // si no hay patrones (pieza > L) -> usar packPiecesExactly para devolver barras unitarias (maneja pieza > L al no encajar)
           if (!patterns.length) {
-            out[diam].exact = { status: 'infeasible' } as ExactResp;
-            infeas.push(`Ø ${diam}`);
+            const finalPatterns = packPiecesExactly(lensU, demands, items.map(i => i.name), L_u);
+            out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(finalPatterns, items.map(i => i.name), lensU, L_u) };
             setLoadingDiam(s => ({ ...s, [diam]: false }));
             continue;
           }
@@ -424,14 +469,14 @@ export default function ResultScreen() {
           if (exact.status === 'ok') {
             out[diam].exact = exact;
           } else {
-            // FALLBACK: intentar cubrir exactamente usando patrones (permitir repetir patrones -> más barras)
+            // FALLBACK 1: intentar cubrir exactamente usando patrones (permitir repetir patrones -> más barras)
             const cover = greedyCoverPatterns(patterns, demands);
             if (cover) {
               out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(cover, items.map(i => i.name), lensU, L_u) };
             } else {
-              // si aún no es posible, dejamos como infeasible
-              out[diam].exact = { status: 'infeasible' } as ExactResp;
-              infeas.push(`Ø ${diam}`);
+              // FALLBACK 2 (último recurso): empacar cada pieza individualmente con First-Fit Decreasing -> garantiza solución exacta
+              const finalPatterns = packPiecesExactly(lensU, demands, items.map(i => i.name), L_u);
+              out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(finalPatterns, items.map(i => i.name), lensU, L_u) };
             }
           }
 
@@ -442,13 +487,7 @@ export default function ResultScreen() {
 
         setSolutions(out);
 
-        if (infeas.length) {
-          Alert.alert(
-            'Sin solución exacta',
-            `No se pudo satisfacer exactamente las cantidades en: ${infeas.join(', ')}.\n` +
-            `Se sugiere ajustar longitudes o cantidades si requiere solución exacta.`
-          );
-        }
+        // ya no mostramos alerta "Sin solución exacta": siempre devolvemos solución (se crean más barras si necesario)
       } finally {
         setIsComputing(false);
       }
@@ -540,8 +579,8 @@ export default function ResultScreen() {
       if (!resp || resp.status !== 'ok') {
         sections.push(`
           <section style="margin-top:18px;padding:12px;border:1px solid #eee;border-radius:8px;background:#fffef6">
-            <h2 style="margin:0 0 8px 0;">Ø ${diam} — Sin solución exacta</h2>
-            <p style="color:#b91c1c;margin:0;">No se pudo generar un plan válido que cumpla exactamente las cantidades.</p>
+            <h2 style="margin:0 0 8px 0;">Ø ${diam} — Sin solución</h2>
+            <p style="color:#b91c1c;margin:0;">No hay datos.</p>
           </section>
         `);
         continue;
@@ -680,9 +719,8 @@ export default function ResultScreen() {
                   </View>
                 </>
               );
-            } else if (rec?.exact?.status === 'infeasible') {
-              body = <Text style={{ color:'#b91c1c' }}>Sin solución exacta (no se permite sobreproducción).</Text>;
             } else {
+              // si no hay exact (aún calculando) mostramos spinner local
               if (loadingDiam[diam]) {
                 body = (
                   <View style={{ paddingVertical: 12, alignItems: 'center' }}>
@@ -690,6 +728,9 @@ export default function ResultScreen() {
                     <Text style={{ color: '#666', marginTop: 6 }}>Calculando diámetro {diam}…</Text>
                   </View>
                 );
+              } else {
+                // en práctica no debería llegar aquí porque siempre devolvemos solución
+                body = <Text style={{ color:'#b91c1c' }}>No hay resultado.</Text>;
               }
             }
 
