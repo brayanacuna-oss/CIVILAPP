@@ -22,13 +22,15 @@ import { BarGraphic, Legend } from '../BarGraphic';
 
 /* ================== Parámetros del solver local ================== */
 const SCALE = 1000;            // mm (0.001 m)
-const MAX_PATTERNS = 2000;     // límite superior (se puede bajar para rendimiento)
-const MAX_NODES_EXACT = 120000;
+const MAX_PATTERNS = 800;      // límite superior (reduce memoria/CPU)
+const MAX_NODES_EXACT = 200000; // tope de nodos visitados en búsqueda exacta
 const KERF_M = 0;              // merma por corte (m), ajusta si quieres
-// DP params (ajusta según dispositivo / tamaño de problema)
-const DP_TOP = 1200;  // keep only top states per item (performance knob)
-const DP_K = 800;     // cuántos patrones devolver
 
+/* DP tuning (ajustable según dispositivo) */
+const DP_TOP_BASE = 600; // TOP por item (se adapta abajo)
+const DP_K_BASE = 600;   // patrones máximos devueltos por DP
+
+/* ================== Tipos ================== */
 type Pattern = {
   counts: number[];  // cuántas piezas de cada ítem van en una barra
   usedU: number;     // unidades usadas
@@ -54,11 +56,111 @@ type ExactResp =
 function toUnits(m: number) { return Math.round(m * SCALE); }
 function toMeters(u: number) { return Math.round((u / SCALE) * 1000) / 1000; }
 
-/* ================== Generador de patrones (DP con poda TOP) ================== */
-function generatePatternsDP(itemLensU: number[], demands: number[], L_u: number, K = DP_K, TOP = DP_TOP): Pattern[] {
-  const n = itemLensU.length;
-  type State = { used: number; counts: Int32Array };
+/* ================== MinHeap (cola de prioridad) ================== */
+class MinHeap<T> {
+  private data: T[] = [];
+  constructor(private cmp: (a: T, b: T) => number) {}
+  size() { return this.data.length; }
+  push(v: T) {
+    this.data.push(v);
+    this.bubbleUp(this.data.length - 1);
+  }
+  pop(): T | undefined {
+    if (!this.data.length) return undefined;
+    const res = this.data[0];
+    const last = this.data.pop()!;
+    if (this.data.length) {
+      this.data[0] = last;
+      this.bubbleDown(0);
+    }
+    return res;
+  }
+  private bubbleUp(i: number) {
+    while (i > 0) {
+      const p = Math.floor((i-1)/2);
+      if (this.cmp(this.data[i], this.data[p]) < 0) {
+        [this.data[i], this.data[p]] = [this.data[p], this.data[i]];
+        i = p;
+      } else break;
+    }
+  }
+  private bubbleDown(i: number) {
+    const n = this.data.length;
+    while (true) {
+      let l = 2*i + 1, r = 2*i + 2, smallest = i;
+      if (l < n && this.cmp(this.data[l], this.data[smallest]) < 0) smallest = l;
+      if (r < n && this.cmp(this.data[r], this.data[smallest]) < 0) smallest = r;
+      if (smallest === i) break;
+      [this.data[i], this.data[smallest]] = [this.data[smallest], this.data[i]];
+      i = smallest;
+    }
+  }
+}
 
+/* ================== Heurística greedy (First-Fit Decreasing) para obtener cota superior ================== */
+function greedyPack(itemsLens: number[], demands: number[], L_u: number, names?: string[]) : { solution: Solution } {
+  const pieces: { len: number; name?: string }[] = [];
+  for (let i = 0; i < itemsLens.length; i++) {
+    const q = demands[i];
+    const cap = (q > 2000) ? 2000 : q;
+    for (let k = 0; k < cap; k++) pieces.push({ len: itemsLens[i], name: names?.[i] });
+  }
+
+  pieces.sort((a,b) => b.len - a.len);
+
+  const bars: number[] = [];
+  const assignment: Array<Array<{name?:string,len:number}>> = [];
+
+  for (const p of pieces) {
+    let placed = false;
+    for (let i = 0; i < bars.length; i++) {
+      if (bars[i] + p.len <= L_u) {
+        bars[i] += p.len;
+        assignment[i].push({ name: p.name, len: toMeters(p.len) });
+        placed = true; break;
+      }
+    }
+    if (!placed) {
+      bars.push(p.len);
+      assignment.push([{ name: p.name, len: toMeters(p.len) }]);
+    }
+  }
+
+  const total_bars = bars.length;
+  const total_bought_m = toMeters(total_bars * L_u);
+  const used_m = assignment.reduce((s, b) => s + b.reduce((t, seg) => t + seg.len, 0), 0);
+  const total_waste_m = Math.round((total_bought_m - used_m) * 1000) / 1000;
+  const util = total_bought_m > 0 ? Math.round(10000 * used_m / total_bought_m) / 100 : 0;
+
+  const barsAssignment = assignment.map(bar =>
+    bar.map(seg => {
+      const nm = typeof seg.name === 'string' && seg.name.length > 0 ? seg.name : 'pieza';
+      return [nm, seg.len] as [string, number];
+    })
+  );
+
+  return {
+    solution: {
+      bars: barsAssignment,
+      total_bars,
+      total_required_m: Math.round(used_m * 1000) / 1000,
+      total_bought_m: Math.round(total_bought_m * 1000) / 1000,
+      total_waste_m,
+      utilization_pct: util,
+      waste_pct: Math.round((100 - util) * 100) / 100,
+    }
+  };
+}
+
+/* ================== Generador de patrones (DP con poda TOP adaptativa) ================== */
+function generatePatternsDP(itemLensU: number[], demands: number[], L_u: number, K = DP_K_BASE, TOP_BASE = DP_TOP_BASE): Pattern[] {
+  const n = itemLensU.length;
+  if (n === 0) return [];
+
+  const totalPieces = demands.reduce((a,b) => a + b, 0);
+  const TOP = Math.max(80, Math.min(1200, Math.floor(TOP_BASE * Math.max(1, 1000 / Math.max(1, totalPieces / (n || 1))))));
+
+  type State = { used: number; counts: Int32Array };
   let states: State[] = [{ used: 0, counts: new Int32Array(n) }];
 
   for (let i = 0; i < n; i++) {
@@ -88,15 +190,13 @@ function generatePatternsDP(itemLensU: number[], demands: number[], L_u: number,
     if (!prev || s.used > prev.used) uniq.set(key, { used: s.used, counts: Array.from(s.counts) });
   }
 
-  // Asegurar patrones unitarios (una pieza por barra) si cabe
+  // asegurar patrones unitarios
   for (let i = 0; i < n; i++) {
     if (itemLensU[i] <= L_u) {
       const counts = Array(n).fill(0);
       counts[i] = 1;
       const key = counts.join(',');
-      if (!uniq.has(key)) {
-        uniq.set(key, { used: itemLensU[i], counts });
-      }
+      if (!uniq.has(key)) uniq.set(key, { used: itemLensU[i], counts });
     }
   }
 
@@ -107,34 +207,87 @@ function generatePatternsDP(itemLensU: number[], demands: number[], L_u: number,
   return arr.slice(0, K);
 }
 
-/* ================== Solver EXACTO (sin sobreproducción) ================== */
+/* ================== Fallback: cubrir demanda con patrones (greedy sobre patrones válidos)
+   - NO permite producir piezas extra (p.counts[i] > rem[i] no se usa)
+   - Permite usar más barras (repetición de patrones) para lograr cubrir la demanda exacta
+*/
+function greedyCoverPatterns(patterns: Pattern[], demand: number[]): Pattern[] | null {
+  const n = demand.length;
+  const rem = demand.slice();
+  const chosenPatterns: Pattern[] = [];
+  const maxSteps = demand.reduce((a,b)=>a+b, 0) * 4 + 1000; // tope de seguridad
+  let steps = 0;
+
+  while (rem.some(r => r > 0) && steps < maxSteps) {
+    let bestIdx = -1;
+    let bestScore = -1; // número piezas cubiertas
+    let bestWaste = Infinity;
+
+    for (let j = 0; j < patterns.length; j++) {
+      const p = patterns[j];
+      // solo patrones que no generen piezas extra
+      let valid = true;
+      let covered = 0;
+      for (let i = 0; i < n; i++) {
+        if (p.counts[i] > rem[i]) { valid = false; break; }
+        covered += p.counts[i];
+      }
+      if (!valid) continue;
+      // preferir patrón que cubra más piezas; en empate, menor desperdicio
+      if (covered > bestScore || (covered === bestScore && p.wasteU < bestWaste)) {
+        bestIdx = j;
+        bestScore = covered;
+        bestWaste = p.wasteU;
+      }
+    }
+
+    if (bestIdx === -1) {
+      // no hay patrón válido restante -> no podemos cubrir exactamente sin crear piezas extra
+      return null;
+    }
+
+    const p = patterns[bestIdx];
+    chosenPatterns.push(p);
+    for (let i = 0; i < n; i++) rem[i] -= p.counts[i];
+    steps++;
+  }
+
+  if (rem.some(r => r > 0)) return null;
+  return chosenPatterns;
+}
+
+/* ================== Solver EXACTO (sin sobreproducción) con heap y poda por cota superior ================== */
 function solveExactByPatterns(
   patterns: Pattern[],
   demand: number[],
   itemsNames: string[],
   itemsLenU: number[],
-  L_u: number
+  L_u: number,
+  upperBoundBars?: number // cota superior (opcional)
 ): ExactResp {
   const n = demand.length;
-  type Node = { key: string; rem: number[]; bars: number; wasteU: number; path: number[] };
-  const startKey = demand.join(',');
+  type Node = { rem: number[]; bars: number; wasteU: number; path: number[] };
   const cmp = (a: Node, b: Node) => (a.bars - b.bars) || (a.wasteU - b.wasteU);
 
-  let frontier: Node[] = [{ key: startKey, rem: demand.slice(), bars: 0, wasteU: 0, path: [] }];
+  const start: Node = { rem: demand.slice(), bars: 0, wasteU: 0, path: [] };
+  const heap = new MinHeap<Node>(cmp);
+  heap.push(start);
+
   const seen = new Map<string, { bars: number; wasteU: number }>();
-  seen.set(startKey, { bars: 0, wasteU: 0 });
+  seen.set(demand.join(','), { bars: 0, wasteU: 0 });
 
   let visited = 0;
 
-  while (frontier.length) {
-    frontier.sort(cmp);
-    const cur = frontier.shift()!;
+  while (heap.size()) {
+    const cur = heap.pop()!;
     if (++visited > MAX_NODES_EXACT) break;
 
     if (cur.rem.every(x => x === 0)) {
       const barsPat = cur.path.map(i => patterns[i]);
       return { status: 'ok', solution: buildSolutionFromBars(barsPat, itemsNames, itemsLenU, L_u) };
     }
+
+    if (upperBoundBars !== undefined && cur.bars >= upperBoundBars) continue;
 
     for (let j = 0; j < patterns.length; j++) {
       const p = patterns[j];
@@ -147,12 +300,14 @@ function solveExactByPatterns(
       if (!valid) continue;
 
       const nb = cur.bars + 1;
+      if (upperBoundBars !== undefined && nb >= upperBoundBars) continue;
+
       const nw = cur.wasteU + p.wasteU;
       const key = next.join(',');
       const best = seen.get(key);
       if (!best || nb < best.bars || (nb === best.bars && nw < best.wasteU)) {
         seen.set(key, { bars: nb, wasteU: nw });
-        frontier.push({ key, rem: next, bars: nb, wasteU: nw, path: [...cur.path, j] });
+        heap.push({ rem: next, bars: nb, wasteU: nw, path: [...cur.path, j] });
       }
     }
   }
@@ -206,7 +361,6 @@ export default function ResultScreen() {
   const L = stockLength || 12;
 
   const L_u = toUnits(L);
-  const kerf_u = toUnits(KERF_M);
 
   const byDiam = useMemo(() => groupByDiameter(pieces || []), [pieces]);
   const [solutions, setSolutions] = useState<Record<string, {
@@ -214,7 +368,6 @@ export default function ResultScreen() {
     items: { name: string; length_m: number; demand: number }[];
   }>>({});
 
-  // loading global y por diámetro
   const [isComputing, setIsComputing] = useState(false);
   const [loadingDiam, setLoadingDiam] = useState<Record<string, boolean>>({});
 
@@ -227,14 +380,15 @@ export default function ResultScreen() {
 
       setIsComputing(true);
       try {
-        // permitir a UI renderizar el overlay antes de computar
         await new Promise<void>((resolve) => InteractionManager.runAfterInteractions(() => resolve()));
 
         const out: Record<string, any> = {};
         const infeas: string[] = [];
 
+        let diamIndex = 0;
         for (const [diam, arr] of byDiam.entries()) {
           setLoadingDiam(s => ({ ...s, [diam]: true }));
+          diamIndex++;
 
           const items = arr.map(p => ({ name: p.label || `${p.minCut} m`, length_m: p.minCut, demand: p.qty }));
           out[diam] = { items } as { items: any; exact?: ExactResp };
@@ -249,7 +403,14 @@ export default function ResultScreen() {
           const lensU = items.map(it => toUnits(it.length_m));
           const demands = items.map(i => i.demand);
 
-          const patterns = generatePatternsDP(lensU, demands, L_u, /*K*/ MAX_PATTERNS, /*TOP*/ DP_TOP);
+          // heurística rápida para cota superior
+          const greedy = greedyPack(lensU, demands, L_u, items.map(i => i.name));
+          const upperBoundBars = greedy.solution.total_bars || Infinity;
+
+          // patrones por DP (rápido con poda TOP adaptativa)
+          const K = Math.min(MAX_PATTERNS, DP_K_BASE);
+          const patterns = generatePatternsDP(lensU, demands, L_u, K, DP_TOP_BASE);
+
           if (!patterns.length) {
             out[diam].exact = { status: 'infeasible' } as ExactResp;
             infeas.push(`Ø ${diam}`);
@@ -257,11 +418,26 @@ export default function ResultScreen() {
             continue;
           }
 
-          const exact = solveExactByPatterns(patterns, demands, items.map(i => i.name), lensU, L_u);
-          out[diam].exact = exact;
-          if (exact.status !== 'ok') infeas.push(`Ø ${diam}`);
+          // intento exacto
+          const exact = solveExactByPatterns(patterns, demands, items.map(i => i.name), lensU, L_u, upperBoundBars);
+
+          if (exact.status === 'ok') {
+            out[diam].exact = exact;
+          } else {
+            // FALLBACK: intentar cubrir exactamente usando patrones (permitir repetir patrones -> más barras)
+            const cover = greedyCoverPatterns(patterns, demands);
+            if (cover) {
+              out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(cover, items.map(i => i.name), lensU, L_u) };
+            } else {
+              // si aún no es posible, dejamos como infeasible
+              out[diam].exact = { status: 'infeasible' } as ExactResp;
+              infeas.push(`Ø ${diam}`);
+            }
+          }
 
           setLoadingDiam(s => ({ ...s, [diam]: false }));
+
+          if ((diamIndex % 2) === 0) await new Promise(r => setTimeout(r, 0));
         }
 
         setSolutions(out);
@@ -270,7 +446,7 @@ export default function ResultScreen() {
           Alert.alert(
             'Sin solución exacta',
             `No se pudo satisfacer exactamente las cantidades en: ${infeas.join(', ')}.\n` +
-            `Ajusta longitudes o cantidades si deseas otra combinación.`
+            `Se sugiere ajustar longitudes o cantidades si requiere solución exacta.`
           );
         }
       } finally {
@@ -288,8 +464,8 @@ export default function ResultScreen() {
       return;
     }
 
-    const PALETTE = ['#F59E0B','#10B981','#3B82F6','#EF4444','#8B5CF6','#14B8A6','#EAB308','#F97316','#22D3EE','#84CC16'];
     const makeColorMap = (names: string[]) => {
+      const PALETTE = ['#F59E0B','#10B981','#3B82F6','#EF4444','#8B5CF6','#14B8A6','#EAB308','#F97316','#22D3EE','#84CC16'];
       const map: Record<string,string> = {};
       names.forEach((n, i)=> map[n] = PALETTE[i % PALETTE.length]);
       return map;
@@ -432,7 +608,6 @@ export default function ResultScreen() {
 
   return (
     <>
-      {/* Overlay modal mientras se computea (evita que la UI parezca congelada) */}
       <Modal visible={isComputing} transparent animationType="fade">
         <View style={overlayStyles.backdrop}>
           <View style={overlayStyles.box}>
@@ -508,7 +683,6 @@ export default function ResultScreen() {
             } else if (rec?.exact?.status === 'infeasible') {
               body = <Text style={{ color:'#b91c1c' }}>Sin solución exacta (no se permite sobreproducción).</Text>;
             } else {
-              // si está en proceso por diámetro, mostrar spinner pequeño
               if (loadingDiam[diam]) {
                 body = (
                   <View style={{ paddingVertical: 12, alignItems: 'center' }}>
