@@ -29,6 +29,7 @@ const KERF_M = 0;              // merma por corte (m), ajusta si quieres
 /* DP tuning (ajustable según dispositivo) */
 const DP_TOP_BASE = 600; // TOP por item (se adapta abajo)
 const DP_K_BASE = 600;   // patrones máximos devueltos por DP
+const FILLER_THRESHOLD_RATIO = 0.25;
 
 /* ================== Tipos ================== */
 type Pattern = {
@@ -97,114 +98,166 @@ class MinHeap<T> {
   }
 }
 
-/* ================== Heurística greedy (First-Fit Decreasing) para obtener cota superior ================== */
+/* ================== Heurística greedy (Híbrida: BFD + Relleno) - CORREGIDA ================== */
 function greedyPack(itemsLens: number[], demands: number[], L_u: number, names?: string[]) : { solution: Solution } {
-  const pieces: { len: number; name?: string }[] = [];
-  for (let i = 0; i < itemsLens.length; i++) {
-    const q = demands[i];
-    const cap = (q > 2000) ? 2000 : q;
-    for (let k = 0; k < cap; k++) pieces.push({ len: itemsLens[i], name: names?.[i] });
-  }
+  
+  const filler_threshold = L_u * FILLER_THRESHOLD_RATIO;
+  
+  // 1. Crear lista de TODAS las piezas
+  const all_pieces: { len: number; name?: string }[] = [];
+  for (let i = 0; i < itemsLens.length; i++) {
+    const q = demands[i];
+    for (let k = 0; k < q; k++) {
+      all_pieces.push({ len: itemsLens[i], name: names?.[i] });
+    }
+  }
 
-  pieces.sort((a,b) => b.len - a.len);
+  // 2. Separar piezas en "principales" y de "relleno"
+  const main_pieces: { len: number; name?: string }[] = [];
+  const filler_pieces: { len: number; name?: string }[] = [];
 
-  const bars: number[] = [];
-  const assignment: Array<Array<{name?:string,len:number}>> = [];
+  for (const p of all_pieces) {
+    if (p.len < filler_threshold) {
+      filler_pieces.push(p);
+    } else {
+      main_pieces.push(p);
+    }
+  }
 
-  for (const p of pieces) {
-    let placed = false;
-    for (let i = 0; i < bars.length; i++) {
-      if (bars[i] + p.len <= L_u) {
-        bars[i] += p.len;
-        assignment[i].push({ name: p.name, len: toMeters(p.len) });
-        placed = true; break;
-      }
-    }
-    if (!placed) {
-      bars.push(p.len);
-      assignment.push([{ name: p.name, len: toMeters(p.len) }]);
-    }
-  }
+  // 3. Ordenar ambas listas de mayor a menor
+  main_pieces.sort((a,b) => b.len - a.len);
+  filler_pieces.sort((a,b) => b.len - a.len);
 
-  const total_bars = bars.length;
-  const total_bought_m = toMeters(total_bars * L_u);
-  const used_m = assignment.reduce((s, b) => s + b.reduce((t, seg) => t + seg.len, 0), 0);
-  const total_waste_m = Math.round((total_bought_m - used_m) * 1000) / 1000;
-  const util = total_bought_m > 0 ? Math.round(10000 * used_m / total_bought_m) / 100 : 0;
+  // 4. Asignar piezas a barras (lógica BFD)
+  const bars: number[] = []; // Almacena el espacio usado
+  const assignment: Array<Array<{name?:string,len:number}>> = [];
 
-  const barsAssignment = assignment.map(bar =>
-    bar.map(seg => {
-      const nm = typeof seg.name === 'string' && seg.name.length > 0 ? seg.name : 'pieza';
-      return [nm, seg.len] as [string, number];
-    })
-  );
+  // Función helper para BFD
+  const bfdPlace = (p: { len: number; name?: string }) => {
+    let bestBarIndex = -1;
+    let minRemainingWaste = Infinity;
 
-  return {
-    solution: {
-      bars: barsAssignment,
-      total_bars,
-      total_required_m: Math.round(used_m * 1000) / 1000,
-      total_bought_m: Math.round(total_bought_m * 1000) / 1000,
-      total_waste_m,
-      utilization_pct: util,
-      waste_pct: Math.round((100 - util) * 100) / 100,
-    }
-  };
+    for (let i = 0; i < bars.length; i++) {
+      const currentWaste = L_u - bars[i];
+      if (p.len <= currentWaste) {
+        const remainingWaste = currentWaste - p.len;
+        if (remainingWaste < minRemainingWaste) { 
+          minRemainingWaste = remainingWaste;
+          bestBarIndex = i;
+        }
+      }
+    }
+    
+    if (bestBarIndex !== -1) {
+      bars[bestBarIndex] += p.len;
+      assignment[bestBarIndex].push({ name: p.name, len: toMeters(p.len) });
+    } else {
+      bars.push(p.len);
+      assignment.push([{ name: p.name, len: toMeters(p.len) }]);
+    }
+  };
+
+  // 5. Procesar piezas PRINCIPALES primero
+  for (const p of main_pieces) {
+    bfdPlace(p);
+  }
+
+  // 6. Procesar piezas de RELLENO al final
+  for (const p of filler_pieces) {
+    bfdPlace(p);
+  }
+
+  // 7. Construir el objeto Solution
+  const total_bars = bars.length;
+  const total_bought_m = toMeters(total_bars * L_u);
+  const used_m = assignment.reduce((s, b) => s + b.reduce((t, seg) => t + seg.len, 0), 0);
+  const total_waste_m = Math.round((total_bought_m - used_m) * 1000) / 1000;
+  const util = total_bought_m > 0 ? Math.round(10000 * used_m / total_bought_m) / 100 : 0;
+
+  const barsAssignment = assignment.map(bar =>
+    bar.map(seg => {
+      const nm = typeof seg.name === 'string' && seg.name.length > 0 ? seg.name : 'pieza';
+      return [nm, seg.len] as [string, number];
+    })
+  );
+
+  return {
+    solution: {
+      bars: barsAssignment,
+      total_bars,
+      total_required_m: Math.round(used_m * 1000) / 1000,
+      total_bought_m: Math.round(total_bought_m * 1000) / 1000,
+      total_waste_m,
+      utilization_pct: util,
+      waste_pct: Math.round((100 - util) * 100) / 100,
+    }
+  };
 }
 
 /* ================== Generador de patrones (DP con poda TOP adaptativa) ================== */
 function generatePatternsDP(itemLensU: number[], demands: number[], L_u: number, K = DP_K_BASE, TOP_BASE = DP_TOP_BASE): Pattern[] {
-  const n = itemLensU.length;
-  if (n === 0) return [];
+  const n = itemLensU.length;
+  if (n === 0) return [];
 
-  const totalPieces = demands.reduce((a,b) => a + b, 0);
-  const TOP = Math.max(80, Math.min(1200, Math.floor(TOP_BASE * Math.max(1, 1000 / Math.max(1, totalPieces / (n || 1))))));
+  // Ajuste de TOP: simplificado y más robusto
+  // Un 'TOP' más alto da mejores patrones pero tarda más.
+  const TOP = Math.max(100, Math.min(1500, TOP_BASE * n));
 
-  type State = { used: number; counts: Int32Array };
-  let states: State[] = [{ used: 0, counts: new Int32Array(n) }];
+  type State = { used: number; counts: Int32Array };
+  let states: State[] = [{ used: 0, counts: new Int32Array(n) }];
 
-  for (let i = 0; i < n; i++) {
-    const li = itemLensU[i];
-    const maxq = Math.min(demands[i], Math.floor(L_u / Math.max(1, li)));
-    const nextStates: State[] = [];
+  for (let i = 0; i < n; i++) {
+    const li = itemLensU[i];
 
-    for (const s of states) {
-      for (let q = 0; q <= maxq; q++) {
-        const newUsed = s.used + q * li;
-        if (newUsed > L_u) break;
-        const nc = s.counts.slice() as Int32Array;
-        nc[i] = q;
-        nextStates.push({ used: newUsed, counts: nc });
-      }
-    }
+    // =================================================================
+    // AQUÍ ESTÁ LA CORRECCIÓN CRÍTICA
+    // Ya no limitamos el patrón por la demanda total ('demands[i]').
+    // Un patrón debe representar lo que FÍSICAMENTE cabe en una barra,
+    // independientemente de cuántas piezas necesites en total.
+    const maxq = Math.floor(L_u / Math.max(1, li));
+    // =================================================================
 
-    nextStates.sort((a, b) => b.used - a.used);
-    states = nextStates.slice(0, TOP);
-  }
+    const nextStates: State[] = [];
 
-  const uniq = new Map<string, { used: number; counts: number[] }>();
-  for (const s of states) {
-    if (s.used === 0) continue;
-    const key = Array.from(s.counts).join(',');
-    const prev = uniq.get(key);
-    if (!prev || s.used > prev.used) uniq.set(key, { used: s.used, counts: Array.from(s.counts) });
-  }
+    for (const s of states) {
+      for (let q = 0; q <= maxq; q++) {
+        const newUsed = s.used + q * li;
+        if (newUsed > L_u) break;
+        const nc = s.counts.slice() as Int32Array;
+        nc[i] = q;
+        nextStates.push({ used: newUsed, counts: nc });
+      }
+    }
 
-  // asegurar patrones unitarios
-  for (let i = 0; i < n; i++) {
-    if (itemLensU[i] <= L_u) {
-      const counts = Array(n).fill(0);
-      counts[i] = 1;
-      const key = counts.join(',');
-      if (!uniq.has(key)) uniq.set(key, { used: itemLensU[i], counts });
-    }
-  }
+    // Poda: mantener solo los 'TOP' mejores estados para el siguiente ítem
+    nextStates.sort((a, b) => b.used - a.used);
+    states = nextStates.slice(0, TOP);
+  }
 
-  const arr = Array.from(uniq.values())
-    .map(x => ({ counts: x.counts, usedU: x.used, wasteU: L_u - x.used, piecesTotal: x.counts.reduce((a,b)=>a+b, 0) }))
-    .sort((a,b) => a.wasteU - b.wasteU || b.usedU - a.usedU);
+  // El resto de la función (eliminación de duplicados y ordenación) es igual
+  const uniq = new Map<string, { used: number; counts: number[] }>();
+  for (const s of states) {
+    if (s.used === 0) continue;
+    const key = Array.from(s.counts).join(',');
+    const prev = uniq.get(key);
+    if (!prev || s.used > prev.used) uniq.set(key, { used: s.used, counts: Array.from(s.counts) });
+  }
 
-  return arr.slice(0, K);
+  // asegurar patrones unitarios (si no fueron generados)
+  for (let i = 0; i < n; i++) {
+    if (itemLensU[i] <= L_u) {
+      const counts = Array(n).fill(0);
+      counts[i] = 1;
+      const key = counts.join(',');
+      if (!uniq.has(key)) uniq.set(key, { used: itemLensU[i], counts });
+    }
+  }
+
+  const arr = Array.from(uniq.values())
+    .map(x => ({ counts: x.counts, usedU: x.used, wasteU: L_u - x.used, piecesTotal: x.counts.reduce((a,b)=>a+b, 0) }))
+    .sort((a,b) => a.wasteU - b.wasteU || b.usedU - a.usedU); // Ordenar por menor desperdicio
+
+  return arr.slice(0, K); // Devolver los K mejores patrones
 }
 
 /* ================== Fallback: cubrir demanda con patrones (greedy sobre patrones válidos)
@@ -256,46 +309,83 @@ function greedyCoverPatterns(patterns: Pattern[], demand: number[]): Pattern[] |
   return chosenPatterns;
 }
 
-/* ================== Último recurso: empaquetar piezas individualmente (si todo lo anterior falla)
-   Esto siempre produce solución exacta sin sobreproducción (crea más barras si hace falta).
+/* ================== Último recurso: empaquetar piezas individualmente (Híbrido: BFD + Relleno)
+   Usa la misma lógica híbrida que greedyPack para máxima optimización.
 */
 function packPiecesExactly(itemLensU: number[], demand: number[], names: string[], L_u: number): Pattern[] {
-  const pieces: { len: number; idx: number }[] = [];
-  for (let i = 0; i < itemLensU.length; i++) {
-    for (let q = 0; q < demand[i]; q++) pieces.push({ len: itemLensU[i], idx: i });
-  }
+  
+  const filler_threshold = L_u * FILLER_THRESHOLD_RATIO;
+  
+  // 1. Crear lista de TODAS las piezas
+  const all_pieces: { len: number; idx: number }[] = [];
+  for (let i = 0; i < itemLensU.length; i++) {
+    for (let q = 0; q < demand[i]; q++) all_pieces.push({ len: itemLensU[i], idx: i });
+  }
 
-  // ordenar desc por tamaño
-  pieces.sort((a,b) => b.len - a.len);
+  // 2. Separar piezas
+  const main_pieces: { len: number; idx: number }[] = [];
+  const filler_pieces: { len: number; idx: number }[] = [];
 
-  const bars: Array<{ used: number; segs: { idx: number; len: number }[] }> = [];
+  for (const p of all_pieces) {
+    if (p.len < filler_threshold) {
+      filler_pieces.push(p);
+  } else {
+      main_pieces.push(p);
+    }
+  }
 
-  for (const p of pieces) {
-    let placed = false;
-    for (const b of bars) {
-      if (b.used + p.len <= L_u) {
-        b.segs.push({ idx: p.idx, len: p.len });
-        b.used += p.len;
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) {
-      bars.push({ used: p.len, segs: [{ idx: p.idx, len: p.len }] });
-    }
-  }
+  // 3. Ordenar ambas listas de mayor a menor
+  main_pieces.sort((a,b) => b.len - a.len);
+  filler_pieces.sort((a,b) => b.len - a.len);
+  
+  // 4. Asignar piezas a barras (lógica BFD)
+  const bars: Array<{ used: number; segs: { idx: number; len: number }[] }> = [];
 
-  // convertir cada barra a Pattern
-  const patterns: Pattern[] = bars.map(b => {
-    const counts = new Array(itemLensU.length).fill(0);
-    for (const s of b.segs) counts[s.idx] += 1;
-    const usedU = b.used;
-    const wasteU = Math.max(0, L_u - usedU);
-    const piecesTotal = counts.reduce((a,b)=>a+b,0);
-    return { counts, usedU, wasteU, piecesTotal };
-  });
+  // Función helper para BFD
+  const bfdPlace = (p: { len: number; idx: number }) => {
+    let bestBarIndex = -1;
+    let minRemainingWaste = Infinity;
 
-  return patterns;
+    for (let i = 0; i < bars.length; i++) {
+      const currentWaste = L_u - bars[i].used;
+      if (p.len <= currentWaste) {
+        const remainingWaste = currentWaste - p.len;
+        if (remainingWaste < minRemainingWaste) {
+          minRemainingWaste = remainingWaste;
+          bestBarIndex = i;
+        }
+      }
+    }
+    
+    if (bestBarIndex !== -1) {
+      bars[bestBarIndex].segs.push({ idx: p.idx, len: p.len });
+      bars[bestBarIndex].used += p.len;
+    } else {
+      bars.push({ used: p.len, segs: [{ idx: p.idx, len: p.len }] });
+    }
+  };
+
+  // 5. Procesar piezas PRINCIPALES primero
+  for (const p of main_pieces) {
+    bfdPlace(p);
+  }
+
+  // 6. Procesar piezas de RELLENO al final
+  for (const p of filler_pieces) {
+    bfdPlace(p);
+  }
+
+  // 7. convertir cada barra a Pattern
+  const patterns: Pattern[] = bars.map(b => {
+    const counts = new Array(itemLensU.length).fill(0);
+    for (const s of b.segs) counts[s.idx] += 1;
+    const usedU = b.used;
+    const wasteU = Math.max(0, L_u - usedU);
+    const piecesTotal = counts.reduce((a,b)=>a+b,0);
+    return { counts, usedU, wasteU, piecesTotal };
+  });
+
+  return patterns;
 }
 
 /* ================== Solver EXACTO (sin sobreproducción) con heap y poda por cota superior ================== */
@@ -359,30 +449,32 @@ function solveExactByPatterns(
 
 /* ================== Reconstrucción de Solution ================== */
 function buildSolutionFromBars(barsPat: Pattern[], names: string[], lensU: number[], L_u: number): Solution {
-  const bars: Array<Array<[string, number]>> = [];
-  for (const p of barsPat) {
-    const segs: Array<[string, number]> = [];
-    for (let i = 0; i < p.counts.length; i++) {
-      const c = p.counts[i];
-      for (let k = 0; k < c; k++) segs.push([names[i], toMeters(lensU[i])]);
-    }
-    bars.push(segs);
-  }
-  const total_bars = bars.length;
-  const total_bought_m = toMeters(total_bars * L_u);
-  const used_m = bars.reduce((s, bar) => s + bar.reduce((t, seg) => t + seg[1], 0), 0);
-  const total_waste_m = Math.round((total_bought_m - used_m) * 1000) / 1000;
-  const util = total_bought_m > 0 ? Math.round(10000 * used_m / total_bought_m) / 100 : 0;
+  const bars: Array<Array<[string, number]>> = [];
+  for (const p of barsPat) {
+    const segs: Array<[string, number]> = [];
+    for (let i = 0; i < p.counts.length; i++) {
+      const c = p.counts[i];
+      for (let k = 0; k < c; k++) segs.push([names[i], toMeters(lensU[i])]);
+    }
+    // Ordenar los segmentos en la barra visualmente de mayor a menor
+    segs.sort((a,b) => b[1] - a[1]);
+    bars.push(segs);
+  }
+  const total_bars = bars.length;
+  const total_bought_m = toMeters(total_bars * L_u);
+  const used_m = bars.reduce((s, bar) => s + bar.reduce((t, seg) => t + seg[1], 0), 0);
+  const total_waste_m = Math.round((total_bought_m - used_m) * 1000) / 1000;
+  const util = total_bought_m > 0 ? Math.round(10000 * used_m / total_bought_m) / 100 : 0;
 
-  return {
-    bars,
-    total_bars,
-    total_required_m: Math.round(used_m * 1000) / 1000,
-    total_bought_m: Math.round(total_bought_m * 1000) / 1000,
-    total_waste_m,
-    utilization_pct: util,
-    waste_pct: Math.round((100 - util) * 100) / 100,
-  };
+  return {
+    bars,
+    total_bars,
+    total_required_m: Math.round(used_m * 1000) / 1000,
+    total_bought_m: Math.round(total_bought_m * 1000) / 1000,
+    total_waste_m,
+    utilization_pct: util,
+    waste_pct: Math.round((100 - util) * 100) / 100,
+};
 }
 
 /* ================== Agrupar por diámetro ================== */
@@ -445,40 +537,28 @@ export default function ResultScreen() {
           }
 
           const lensU = items.map(it => toUnits(it.length_m));
-          const demands = items.map(i => i.demand);
+          const demands = items.map(i => i.demand);
 
-          // heurística rápida para cota superior
-          const greedy = greedyPack(lensU, demands, L_u, items.map(i => i.name));
-          const upperBoundBars = greedy.solution.total_bars || Infinity;
+          /* ======================================================================
+             NUEVA LÓGICA: USAR SIEMPRE LA HEURÍSTICA BFD + RELLENO
+             Esta es la lógica que SÍ rellena huecos de mayor a menor.
+          ====================================================================== */
+          
+          // 1. Usamos la heurística BFD + Relleno (greedyPack) como la solución UNICA y principal.
+          //    Esto garantiza que las piezas grandes se colocan primero y las pequeñas rellenan los huecos.
+          const bfdSolution = greedyPack(
+            lensU, 
+            demands, 
+            L_u, 
+            items.map(i => i.name)
+          );
 
-          // patrones por DP (rápido con poda TOP adaptativa)
-          const K = Math.min(MAX_PATTERNS, DP_K_BASE);
-          const patterns = generatePatternsDP(lensU, demands, L_u, K, DP_TOP_BASE);
+          // 2. Asignamos directamente la solución
+          out[diam].exact = { status: 'ok', solution: bfdSolution.solution };
 
-          // si no hay patrones (pieza > L) -> usar packPiecesExactly para devolver barras unitarias (maneja pieza > L al no encajar)
-          if (!patterns.length) {
-            const finalPatterns = packPiecesExactly(lensU, demands, items.map(i => i.name), L_u);
-            out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(finalPatterns, items.map(i => i.name), lensU, L_u) };
-            setLoadingDiam(s => ({ ...s, [diam]: false }));
-            continue;
-          }
-
-          // intento exacto
-          const exact = solveExactByPatterns(patterns, demands, items.map(i => i.name), lensU, L_u, upperBoundBars);
-
-          if (exact.status === 'ok') {
-            out[diam].exact = exact;
-          } else {
-            // FALLBACK 1: intentar cubrir exactamente usando patrones (permitir repetir patrones -> más barras)
-            const cover = greedyCoverPatterns(patterns, demands);
-            if (cover) {
-              out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(cover, items.map(i => i.name), lensU, L_u) };
-            } else {
-              // FALLBACK 2 (último recurso): empacar cada pieza individualmente con First-Fit Decreasing -> garantiza solución exacta
-              const finalPatterns = packPiecesExactly(lensU, demands, items.map(i => i.name), L_u);
-              out[diam].exact = { status: 'ok', solution: buildSolutionFromBars(finalPatterns, items.map(i => i.name), lensU, L_u) };
-            }
-          }
+          /* ======================================================================
+             FIN DE LA NUEVA LÓGICA
+          ====================================================================== */
 
           setLoadingDiam(s => ({ ...s, [diam]: false }));
 

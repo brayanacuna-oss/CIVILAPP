@@ -168,7 +168,7 @@ export default function AddPieceScreen() {
 
         {/* Formulario (labels fuera; no dependemos de placeholders) */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Nueva línea (se agrega al diámetro activo)</Text>
+          
 
           <View style={styles.formRow}>
             <Text style={styles.fieldLabel}>Etiqueta</Text>
